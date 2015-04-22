@@ -42,6 +42,7 @@ import android.support.v4.app.FragmentTransaction;
 import android.support.v7.widget.LinearLayoutManager;
 import android.support.v7.widget.RecyclerView;
 import android.text.TextUtils;
+import android.util.Log;
 import android.view.KeyEvent;
 import android.view.LayoutInflater;
 import android.view.Menu;
@@ -82,6 +83,8 @@ import com.ichi2.async.DeckTask;
 import com.ichi2.async.DeckTask.TaskData;
 import com.ichi2.compat.CompatHelper;
 import com.ichi2.libanki.Collection;
+import com.ichi2.libanki.Models;
+import com.ichi2.libanki.Note;
 import com.ichi2.libanki.Sched;
 import com.ichi2.themes.StyledProgressDialog;
 import com.ichi2.themes.Themes;
@@ -94,6 +97,7 @@ import org.json.JSONObject;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 
@@ -110,6 +114,8 @@ public class DeckPicker extends NavigationDrawerActivity implements OnShowcaseEv
 
     public static final String EXTRA_START = "start";
     public static final String EXTRA_DECK_ID = "deckId";
+    protected static final String ACTION_CREATE_FLASHCARD_JIKO = "com.vocabliss.jiko.CREATE_FLASHCARDS";
+
     public static final int EXTRA_START_NOTHING = 0;
     public static final int EXTRA_START_REVIEWER = 1;
     public static final int EXTRA_START_DECKPICKER = 2;
@@ -167,6 +173,10 @@ public class DeckPicker extends NavigationDrawerActivity implements OnShowcaseEv
      * deck (e.g., when a filtered deck was created in a study options fragment).
      */
     private Long mFocusedDeck;
+
+	// PDG : add multiple cards
+    private static boolean mAddMultiCards = false;
+    private static String mAddMultiCardsContent;
 
     // ----------------------------------------------------------------------------
     // LISTENERS
@@ -354,7 +364,19 @@ public class DeckPicker extends NavigationDrawerActivity implements OnShowcaseEv
     @Override
     protected void onCreate(Bundle savedInstanceState) throws SQLException {
         Timber.d("onCreate()");
+        Log.e("PDG-DeckPicker", "DeckPicker: onCreate started.");
+        /*  pdg : test lazy getIntent()
         Intent intent = getIntent();
+        String action = (intent != null) ? intent.getAction() : null;
+        if (action != null && (ACTION_CREATE_FLASHCARD_JIKO.equals(action))) {
+            Log.i("PDG-DeckPicker", "onCreate: intent action == " + action);
+            mAddMultiCards = true;
+            Log.i("PDG-DeckPicker", "onCreate: intent SOURCE_TEXT = " + intent.getStringExtra("SOURCE_TEXT"));
+            Log.i("PDG-DeckPicker", "onCreate: intent TARGET_TEXT = " + intent.getStringExtra("TARGET_TEXT"));
+            mAddMultiCardsContent = intent.getStringExtra("TARGET_TEXT");
+        }
+        */
+
         Themes.applyTheme(this);
         super.onCreate(savedInstanceState);
 
@@ -1511,7 +1533,7 @@ public class DeckPicker extends NavigationDrawerActivity implements OnShowcaseEv
      * rebuilding the deck if the settings change.
      */
     private void loadStudyOptionsFragment(boolean withDeckOptions) {
-        StudyOptionsFragment details = StudyOptionsFragment.newInstance(withDeckOptions);
+        StudyOptionsFragment details = StudyOptionsFragment.newInstance(withDeckOptions, null); // pdg : modified to pass full extras Bundle to Fragment
         FragmentTransaction ft = getSupportFragmentManager().beginTransaction();
         ft.replace(R.id.studyoptions_fragment, details);
         ft.commit();
@@ -1572,12 +1594,59 @@ public class DeckPicker extends NavigationDrawerActivity implements OnShowcaseEv
 
 
     private void openStudyOptions(boolean withDeckOptions) {
+        openStudyOptions(withDeckOptions, -1);
+    }
+
+    private void openStudyOptions(boolean withDeckOptions, long did) {
+        Log.w("PDG-DeckPicker", "openStudyOptions mFragmented=" + mFragmented + "; mAddMultiCards=" + mAddMultiCards);
         if (mFragmented) {
             // The fragment will show the study options screen instead of launching a new activity.
             loadStudyOptionsFragment(withDeckOptions);
         } else {
             Intent intent = new Intent();
             intent.putExtra("withDeckOptions", withDeckOptions);
+
+            // pdg : test getIntent() here. Goal is to avoid extra processing in onCreate and globals (mAddMultiCards)
+            // THIS IS NEW, TO BE VALIDATED / checked for robustness by playing with activity start / restart / configuration changes etc.
+            // Following is copied from onCreate. If validated, need to rewrite and clean up onCreate.
+            Log.e("PDG-DeckPicker", "openStudyOptions: getIntent.");
+            Intent intentIn = getIntent();
+            String action = (intentIn != null) ? intentIn.getAction() : null;
+            if (action != null && (ACTION_CREATE_FLASHCARD_JIKO.equals(action))) {
+                Log.i("PDG-DeckPicker", "onCreate: intent action == " + action);
+                mAddMultiCards = true;
+                Log.i("PDG-DeckPicker", "onCreate: intent SOURCE_TEXT = " + intentIn.getStringExtra("SOURCE_TEXT"));
+                Log.i("PDG-DeckPicker", "onCreate: intent TARGET_TEXT = " + intentIn.getStringExtra("TARGET_TEXT"));
+                mAddMultiCardsContent = intentIn.getStringExtra("TARGET_TEXT");
+            }
+            else mAddMultiCards = false;
+
+            // pdg : if add multiple cards, set the intent.
+            if (mAddMultiCards) {
+                mAddMultiCards = false;
+
+                /* pdg TBD to clean up
+                Collection coll = getCol();
+                Log.w("PDG-DeckPicker", "handleDeckSelection mCol="+coll);
+                String deckNameCurrent = "NotInitialized";
+                long didCurrent = -1;
+                try {
+                    didCurrent = coll.getDecks().selected();
+                    deckNameCurrent = coll.getDecks().current().getString("name");
+                } catch (JSONException e) {
+                    e.printStackTrace();
+                }
+                Log.w("PDG-DeckPicker", "handleDeckSelection current deckName="+deckNameCurrent+"; deckId="+didCurrent);
+                */
+                
+                Log.w("PDG-DeckPicker", "handleDeckSelection selected deckId="+did);
+
+            
+                intent.putExtra("index", did);
+                intent.putExtra("importNotes", true);
+                intent.putExtra(Intent.EXTRA_TEXT, mAddMultiCardsContent);
+                Log.w("PDG-DeckPicker", "set intent for StudyOptionsActivity with EXTRA_TEXT ="+mAddMultiCardsContent);
+            }
             intent.setClass(this, StudyOptionsActivity.class);
             startActivityForResultWithAnimation(intent, SHOW_STUDYOPTIONS, ActivityTransitionAnimation.LEFT);
         }
@@ -1587,7 +1656,7 @@ public class DeckPicker extends NavigationDrawerActivity implements OnShowcaseEv
     private void handleDeckSelection(long did) {
         getCol().getDecks().select(did);
         mFocusedDeck = did;
-        openStudyOptions(false);
+        openStudyOptions(false, did);
     }
 
 

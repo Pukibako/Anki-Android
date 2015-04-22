@@ -18,6 +18,7 @@ package com.ichi2.anki;
 
 import android.content.Intent;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.KeyEvent;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -37,6 +38,8 @@ public class StudyOptionsActivity extends NavigationDrawerActivity implements St
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        Log.e("PDG-StudyOptionsActivity", "StudyOptionsActivity: onCreate");
+
         Themes.applyTheme(this);
         super.onCreate(savedInstanceState);
         // The empty frame layout is a workaround for fragments not showing when they are added
@@ -64,11 +67,15 @@ public class StudyOptionsActivity extends NavigationDrawerActivity implements St
 
 
     private void loadStudyOptionsFragment() {
+        Log.e("PDG-StudyOptionsActivity", "loadStudyOptionsFragment");
+        Bundle extraPdg = null;
+
         boolean withDeckOptions = false;
         if (getIntent().getExtras() != null) {
+            extraPdg = getIntent().getExtras();
             withDeckOptions = getIntent().getExtras().getBoolean("withDeckOptions");
         }
-        StudyOptionsFragment currentFragment = StudyOptionsFragment.newInstance(withDeckOptions);
+        StudyOptionsFragment currentFragment = StudyOptionsFragment.newInstance(withDeckOptions, extraPdg);
         getSupportFragmentManager().beginTransaction().replace(R.id.studyoptions_frame, currentFragment).commit();
     }
 

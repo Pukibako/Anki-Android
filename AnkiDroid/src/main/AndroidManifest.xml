@@ -143,6 +143,11 @@
             android:configChanges="keyboardHidden|orientation|screenSize|locale"
             android:label="@string/app_name"
             android:theme="@style/Theme_Start" >"
+            <intent-filter>
+                <action android:name="com.vocabliss.jiko.CREATE_FLASHCARDS" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
         </activity>
         <activity
             android:name="com.ichi2.anki.StudyOptionsActivity"

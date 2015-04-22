@@ -14,6 +14,7 @@
 
 package com.ichi2.anki;
 
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.DialogInterface;
 import android.content.DialogInterface.OnCancelListener;
@@ -29,6 +30,7 @@ import android.support.v4.app.LoaderManager;
 import android.support.v4.content.Loader;
 import android.text.Html;
 import android.text.method.LinkMovementMethod;
+import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.Menu;
 import android.view.MenuInflater;
@@ -53,6 +55,8 @@ import com.ichi2.async.CollectionLoader;
 import com.ichi2.async.DeckTask;
 import com.ichi2.libanki.Collection;
 import com.ichi2.libanki.Consts;
+import com.ichi2.libanki.Models;
+import com.ichi2.libanki.Note;
 import com.ichi2.libanki.Utils;
 import com.ichi2.themes.StyledProgressDialog;
 import com.ichi2.themes.Themes;
@@ -67,6 +71,7 @@ import java.util.List;
 
 import timber.log.Timber;
 
+@SuppressLint("LongLogTag")
 public class StudyOptionsFragment extends Fragment implements LoaderManager.LoaderCallbacks<Collection> {
 
 
@@ -228,11 +233,11 @@ public class StudyOptionsFragment extends Fragment implements LoaderManager.Load
      *                        which shows the current deck's options. Set to true when programmatically
      *                        opening a new filtered deck for the first time.
      */
-    public static StudyOptionsFragment newInstance(boolean withDeckOptions) {
+    public static StudyOptionsFragment newInstance(boolean withDeckOptions, Bundle extrasPdg) { // modified to pass extras from Intent to Fragment.
         StudyOptionsFragment f = new StudyOptionsFragment();
-        Bundle args = new Bundle();
+        Bundle args = (extrasPdg != null) ? extrasPdg : new Bundle();
         args.putBoolean("withDeckOptions", withDeckOptions);
-        f.setArguments(args);
+        f.setArguments(args);   // extras can then be read with getArguments()
         return f;
     }
 
@@ -256,17 +261,129 @@ public class StudyOptionsFragment extends Fragment implements LoaderManager.Load
     private void onCollectionLoaded(Collection col) {
         mCollection = col;
         initAllContentViews();
-        if (getArguments() != null) {
+        boolean pdgImportNotes = false;
+        if (getArguments() != null) {   // pdg : always != null, but not ensured at code level.
             mLoadWithDeckOptions = getArguments().getBoolean("withDeckOptions");
+            if (getArguments().getBoolean("importNotes"))  pdgImportNotes = true;
         }
-        refreshInterface(true);
+
+        if (! pdgImportNotes) {  // pdg : else postpone refreshInterface() after import. It calls dismissProgressDialog() which removes the progress dialog of importing.
+            // pdg : Also in case of import, don't trigger the update-values now since the nbs of notes will change and the update-values will have to be re-processed.
+            // And besides on anki 1.x launching the two tasks in a row will hang the app 30% of the time - It seems there is a race condition between both TASKS...
+            // On Anki 2.5 this seems to be better handled : no hang seen on ~ 10 imports.
+            refreshInterface(true);
+        }
         setHasOptionsMenu(true);
         ((AnkiActivity) getActivity()).hideProgressBar();
         // rebuild action bar so that Showcase works correctly
-        if (mFragmented) {
+        if (mFragmented) {  // pdg : need to be tested !! should not conflict with pdgImportNotesFromIntent but maybe with postponing of refreshInterface
             ((DeckPicker) getActivity()).reloadShowcaseView();
         }
+        Log.w("PDG-StudyOptionsFragment", "onCollectionLoaded with importNotes = " + getArguments().getBoolean("importNotes"));
+        if (pdgImportNotes) {  pdgImportNotesFromIntent();  }
+        // resetAndUpdateValuesFromDeck(); // pdg : this was replaced with above  refreshInterface(true); in Anki 2.5x 2015-04
     }
+    
+    private void pdgImportNotesFromIntent() {
+        getArguments().putBoolean("importNotes", false);   // getArguments() already checked for null
+        // Log.w("PDG-importNotesFromIntent", getArguments().getString(Intent.EXTRA_TEXT));
+        
+        String notesToAdd = getArguments().getString(Intent.EXTRA_TEXT);
+        // String notesToAdd = pdgImportTestFakeNotes();
+        pdgCalcNbCardsToImport(notesToAdd);
+        DeckTask.TaskData taskInputs = new DeckTask.TaskData(mCollection, notesToAdd); // mCollection was set upon onCollectionLoaded
+        Log.w("PDG-importNotesFromIntent", "createView > DeckTask.launchDeckTask(DeckTask.TASK_TYPE_ADD_FACT...);");
+        DeckTask.launchDeckTask(DeckTask.TASK_TYPE_ADD_MULTI_FACTS, mSaveMultiFactsHandler, taskInputs);
+    }
+    int mpdgNbNotesToAdd;
+    int mpdgNbCardsInTemplate;
+    private void pdgCalcNbCardsToImport(String str) {
+        int nbNotes = 1;
+        for (int i=1; i<str.length()-1; i++)  {  if (str.charAt(i) == '\n')  nbNotes++;  }
+        mpdgNbNotesToAdd = nbNotes;
+        
+        // -- Get model
+        JSONObject model = getCol().getModels().current();
+        try {
+            Log.w("PDG-importNotesFromIntent", "nbFieldsInModel " + model.getString("name") + " = " + Models.fieldNames(model).size());
+            mpdgNbCardsInTemplate = model.getJSONArray("tmpls").length();
+        } catch (JSONException e) {  e.printStackTrace();  }
+    }
+    private Note [] pdgImportCreateNotesObsolete(JSONObject model, long mCurrentDid) {
+        String [] lines = getArguments().getString(Intent.EXTRA_TEXT).split("\n");
+        Note [] notesToAdd = new Note [lines.length];
+        
+        for (int count=0; count<lines.length; count++) {
+            Note newNote = new Note(getCol(), model);
+            try {
+                newNote.model().put("did", mCurrentDid);
+            } catch (JSONException e) {
+                throw new RuntimeException(e);
+            }
+            newNote.addTag("");
+            String [] fields = lines[count].split(":");
+
+            for (int countField=0; countField<Models.fieldNames(model).size(); countField++) {  if (countField<fields.length)  newNote.values()[countField] = fields[countField];  }
+            notesToAdd[count] = newNote;
+        }
+        return notesToAdd;
+    }
+    
+    private String pdgImportTestFakeNotes() {
+        String notesToAdd = "";
+        // -- Get model
+        JSONObject model = getCol().getModels().current();
+        try {
+            Log.w("PDG-importNotesFromIntent", "nbFieldsInModel " + model.getString("name") + " = " + Models.fieldNames(model).size());
+        } catch (JSONException e) {  e.printStackTrace();  }
+        
+        for (int countNote=0; countNote<100; countNote++) {
+            // Note newNote = new Note(AnkiDroidApp.getCol(), model);
+            // notesToAdd[countNote] = "";
+            for (int countField=0; countField<Models.fieldNames(model).size(); countField++)  {  
+                notesToAdd += "TEST-A-" + countNote + "--" + countField + ":";  }
+            notesToAdd += "\n";
+        }
+        return notesToAdd;
+    }
+
+    private DeckTask.TaskListener mSaveMultiFactsHandler = new DeckTask.TaskListener() {
+        private boolean mCloseAfter = false;
+        @Override
+        public void onPreExecute() {
+            Resources res = getActivity().getResources();
+            Log.w("PDG-mSaveMultiFactsHandler", "onPreExecute : dont' display dialog with cancelable = true");
+            mProgressDialog = StyledProgressDialog.show(getActivity(), "Notes Import...", "Importing " + mpdgNbNotesToAdd + " notes and generating cards", true, null );
+        }
+        @Override
+        public void onProgressUpdate(DeckTask.TaskData... values) {
+            int count = values[0].getInt();
+            Log.e("PDG-trace", "onProgressUpdate count:" + count);
+            mCloseAfter = true;
+        }
+        @Override
+        public void onPostExecute(DeckTask.TaskData result) {
+            int nbNewCardsAdded = result.getIntList()[0];
+            int nbNotesMerged   = result.getIntList()[1];
+            Log.d("PDG-trace", "onPostExecute with : " + nbNewCardsAdded + " cards added.");
+            if (mProgressDialog != null && mProgressDialog.isShowing()) {
+                try {
+                    mProgressDialog.dismiss();
+                } catch (IllegalArgumentException e) {
+                    Log.e(AnkiDroidApp.TAG, "Card Editor: Error on dismissing progress dialog: " + e);
+                }
+            }
+            // if (mCloseAfter) { //  closeCardEditor
+            // }
+            Log.d("PDG-trace", "toast with merged notes number = " + nbNotesMerged);
+            // resetAndUpdateValuesFromDeck(); // replaced with refreshInterface(true);
+            refreshInterface(true);
+            Themes.showThemedToast(getActivity(), "Added " + nbNewCardsAdded + " new cards, and merged " + nbNotesMerged + " existing notes.", false);
+        }
+        @Override
+        public void onCancelled() {  }
+    };
+
 
 
     @Override

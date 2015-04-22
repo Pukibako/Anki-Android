@@ -21,6 +21,7 @@ package com.ichi2.async;
 import android.content.Context;
 import android.content.res.Resources;
 import android.os.AsyncTask;
+import android.util.Log;
 
 
 import com.google.gson.stream.JsonReader;
@@ -35,6 +36,8 @@ import com.ichi2.anki.exception.ConfirmModSchemaException;
 import com.ichi2.libanki.AnkiPackageExporter;
 import com.ichi2.libanki.Card;
 import com.ichi2.libanki.Collection;
+import com.ichi2.libanki.Decks;
+import com.ichi2.libanki.Models;
 import com.ichi2.libanki.Note;
 import com.ichi2.libanki.Sched;
 import com.ichi2.libanki.Stats;
@@ -80,6 +83,7 @@ public class DeckTask extends BaseAsyncTask<DeckTask.TaskData, DeckTask.TaskData
     public static final int TASK_TYPE_ADD_FACT = 6;
     public static final int TASK_TYPE_UPDATE_FACT = 7;
     public static final int TASK_TYPE_UNDO = 8;
+    public static final int TASK_TYPE_ADD_MULTI_FACTS = 10;
     public static final int TASK_TYPE_DISMISS_NOTE = 11;
     public static final int TASK_TYPE_CHECK_DATABASE = 14;
     public static final int TASK_TYPE_DELETE_BACKUPS = 16;
@@ -215,13 +219,16 @@ public class DeckTask extends BaseAsyncTask<DeckTask.TaskData, DeckTask.TaskData
     // This method and those that are called here are executed in a new thread
     @Override
     protected TaskData doInBackground(TaskData... params) {
+	    Log.i("PDG-doInBackground", "doInBackground started with task type : " + mType);
         super.doInBackground(params);
         // Wait for previous thread (if any) to finish before continuing
         if (mPreviousTask != null && mPreviousTask.getStatus() != AsyncTask.Status.FINISHED) {
+            Log.i(AnkiDroidApp.TAG, "Waiting for " + mPreviousTask.mType + " to finish before starting " + mType);
             Timber.d("Waiting for %d to finish before starting %d", mPreviousTask.mType, mType);
 
             // Let user know if the last deck close is still performing a backup.
             if (mType == TASK_TYPE_OPEN_COLLECTION && mPreviousTask.mType == TASK_TYPE_CLOSE_DECK) {
+                Log.i("PDG-doInBackground", "Previous task not finished. > publishProgress ");
                 publishProgress(new TaskData(AnkiDroidApp.getInstance().getBaseContext().getResources()
                         .getString(R.string.finish_operation)));
             }
@@ -258,6 +265,9 @@ public class DeckTask extends BaseAsyncTask<DeckTask.TaskData, DeckTask.TaskData
 
             case TASK_TYPE_ADD_FACT:
                 return doInBackgroundAddNote(params);
+
+            case TASK_TYPE_ADD_MULTI_FACTS:
+                return doInBackgroundAddMultiNotes(params);
 
             case TASK_TYPE_UPDATE_FACT:
                 return doInBackgroundUpdateNote(params);
@@ -391,6 +401,180 @@ public class DeckTask extends BaseAsyncTask<DeckTask.TaskData, DeckTask.TaskData
             return new TaskData(false);
         }
         return new TaskData(true);
+    }
+
+    private TaskData doInBackgroundAddMultiNotes(TaskData[] params) {
+        String lines = (String) params[0].getString();
+        colPdg = params[0].getCollection();
+        int [] cardsCounts = doInBgImportNotesMerge(lines);
+        return new TaskData(cardsCounts);
+	}
+
+    private Collection colPdg;
+	
+    public int [] doInBgImportNotesMerge(String lines) {
+        final String LOG_TAG = "doInBgImportNotesMerge";
+        
+        //Collection col = notesToImport[0].getCol();
+        String [] linesToImport = lines.split("\n");
+        Integer nbNotesToAdd = linesToImport.length;
+        Log.e(LOG_TAG, "Add/Merge notes : " + nbNotesToAdd);
+        int nbNewCardsAdded = 0;
+        int nbNotesMerged   = 0;
+        
+        // -- Get DID
+        long did;
+        try {
+            Decks decks = colPdg.getDecks();
+            JSONObject jsono = decks.current();
+            did = jsono.getLong("id");
+            // did = colPdg.getDecks().current().getLong("id");
+        } catch (JSONException e) {
+            did = 1;
+            throw new RuntimeException(e);
+        }
+        if (colPdg.getDecks().isDyn(did)) {  did = 1;  }
+        
+        // -- Get model
+        JSONObject model = colPdg.getModels().current();
+        try {
+            Log.w("PDG-importNotesFromIntent", "nbFieldsInModel " + model.getString("name") /* + " = " + Models.fieldNames(model).size()*/ );
+        } catch (JSONException e) {  e.printStackTrace();  }
+        
+        AnkiDb ankiDB = colPdg.getDb();
+        try {
+            for (int cntNote = 0; cntNote < nbNotesToAdd; cntNote++) {
+                ankiDB.getDatabase().beginTransaction();
+                //Log.d(LOG_TAG, "beginTransaction");
+                Note noteToImport = bgCreateNote(did, model, linesToImport[cntNote]);
+                int [] counts = bgAddMergeNote(noteToImport);
+                nbNewCardsAdded += counts[0];
+                nbNotesMerged   += counts[1];
+                publishProgress(new TaskData(cntNote));  // publishProgress every 100 notes
+                ankiDB.getDatabase().setTransactionSuccessful();
+                ankiDB.getDatabase().endTransaction();
+                //Log.d(LOG_TAG, "endTransaction");
+            }
+        } finally {
+        }
+        return new int [] { nbNewCardsAdded, nbNotesMerged };
+    }
+    
+    private Note bgCreateNote(long did, JSONObject model, String line) {
+        Note newNote = new Note(colPdg, model);
+        try {
+            newNote.model().put("did", did);
+        } catch (JSONException e) {
+            throw new RuntimeException(e);
+        }
+        newNote.addTag("");
+        
+        String [] fields = line.split(":");
+        for (int countField=0; countField< Models.fieldNames(model).size(); countField++)  {
+            if (countField<fields.length)  newNote.values()[countField] = fields[countField];  }
+        return newNote;
+    }
+    
+    private int [] bgAddMergeNote(Note noteToAdd) {
+        final String LOG_TAG = "bgAddMergeNote";
+        Log.w(LOG_TAG, "Trying to merge card for kanji = " + noteToAdd.getFields()[0] + "; kana = " + noteToAdd.getFields()[1]);
+        int nbNewCardsAdded = 0;
+        int nbNotesMerged = 0;
+        boolean merged = false;
+        List<Long> listNotesFound = colPdg.findNotes(noteToAdd.getFields()[0] + " " + noteToAdd.getFields()[1]);  // find notes containing both kanji and kana
+        for (Long noteid : listNotesFound)  {
+            Note noteFound = new Note(colPdg, noteid);
+            Log.d(LOG_TAG, "findNotes : " + Arrays.toString(noteFound.getFields()) + " Tags: " +  noteFound.stringTags() );
+            
+            // Make sure kanjis match exactly !
+            if ( ! noteFound.getFields()[0].trim().equals(noteToAdd.getFields()[0]) )  {  Log.d(LOG_TAG, "kanji are not equal, don't merge this one !");  continue;  }
+            
+            // Loop through fields after kana (ie >= 2) and see if they are identical, if not concat them.
+            int nbFieldsInModel = Models.fieldNames(noteFound.model()).size();
+            for (int countField=2; countField<nbFieldsInModel; countField++)  {
+                if (countField<noteToAdd.getFields().length)  {
+                    if (! noteFound.getFields()[countField].equals(noteToAdd.getFields()[countField]))  {  // Only concat if fields are not identical.
+                        String str1 = noteFound.getFields()[countField].trim();
+                        String str2 = noteToAdd.getFields()[countField].trim();
+                        if      (str1.length()==0)  noteFound.getFields()[countField] = str2;
+                        else if (str2.length()==0)  noteFound.getFields()[countField] = str1;
+                        else                        noteFound.getFields()[countField] = str1 + "  <+>\n" + str2;
+                    }
+                    else
+                        Log.d(LOG_TAG, "fields are already identical : " + noteFound.getFields()[countField]);
+                }
+            }
+            // Tag the note as merged, and save it.
+            // noteFound.addTag("marked");
+            // if (noteFound.hasTag("marked"))  {  noteFound.delTag("marked");  }
+            noteFound.addTag("merged");
+            noteFound.flush();
+            nbNotesMerged += 1;
+            merged = true;
+            Log.d("findNotes", "after merge : " + Arrays.toString(noteFound.getFields()) + " Tags: " +  noteFound.stringTags() );
+        }
+        
+        if (! merged)  {
+            //Log.i(LOG_TAG, "Not merged, so finally added a new note. ");
+            // noteToAdd.addTag("marked");
+            // if (noteToAdd.hasTag("marked"))  {  noteToAdd.delTag("marked");  }
+            // noteToAdd.addTag("added");
+            nbNewCardsAdded += colPdg.addNote(noteToAdd);
+            
+            // Check card creation :
+            listNotesFound = colPdg.findNotes(noteToAdd.getFields()[0] + " " + noteToAdd.getFields()[1]);  // find notes containing both kanji and kana
+            // if (listNotesFound.size()==0)  Log.e(LOG_TAG, "ERROR : note was NOT PROPERLY CREATED / SAVED !!!!!!!");
+            //Log.e(LOG_TAG, "Added " + listNotesFound.size() + " note. ");
+            if (listNotesFound.size()>=1) Log.e(LOG_TAG, Arrays.toString(new Note(colPdg, listNotesFound.get(0)).getFields()));
+        }
+        return new int [] { nbNewCardsAdded, nbNotesMerged };
+    }
+
+    private static void doInBgMergeTest(Note [] notes) {
+        // Test update and mark note
+        Collection col = notes[0].getCol();
+        List<Long> listNotes = col.findNotes("物騒 ぶっそう");  // target to test out
+        for (Long noteid : listNotes)  {
+            Note note = new Note(col, noteid);
+            int nbFieldsInModel = Models.fieldNames(note.model()).size();
+            Log.e("findNotes", "before : " + Arrays.toString(note.getFields()) + " Tags: " +  note.stringTags() );
+            String [] fieldsToAppend = { "1", "2", "3", "4" };
+            for (int countField=0; countField<nbFieldsInModel; countField++)  {  
+                if (countField<fieldsToAppend.length)  note.getFields()[countField] = note.getFields()[countField] + " " + fieldsToAppend[countField];  }
+            note.addTag("marked");
+            Log.e("findNotes", "before flush : " + Arrays.toString(note.getFields()) + " Tags: " +  note.stringTags() );
+            note.flush();
+        }
+        listNotes = col.findNotes("物騒 ぶっそう");  // target to test out
+        for (Long noteid : listNotes)  {
+            Note note = new Note(col, noteid);
+            Log.e("findNotes", "after flush : " + Arrays.toString(note.getFields()) + " Tags: " +  note.stringTags() );
+        }
+    }
+    	
+	private void doInBgImportNotesSimple(Note [] notes) {
+        final String LOG_TAG = "doInBgAddMultiNotes";
+        
+        Collection col = notes[0].getCol();
+        Integer nbNotesToAdd = notes.length;
+        Log.w(LOG_TAG, "doInBackgroundAddMultiNotes for count=" + nbNotesToAdd);
+        
+        AnkiDb ankiDB = col.getDb();
+        ankiDB.getDatabase().beginTransaction();
+        Log.w(LOG_TAG, "beginTransaction");
+        try {
+            for (int cntNote = 0; cntNote < nbNotesToAdd; cntNote++) {
+                // publishProgress every 10 notes
+                int nbNew = col.addNote(notes[cntNote]);
+                Log.d(LOG_TAG, "addNote() done. nbNew=" + nbNew);
+                if (cntNote % 10 == 0)
+                    publishProgress(new TaskData(cntNote));
+            }
+            ankiDB.getDatabase().setTransactionSuccessful();
+        } finally {
+            ankiDB.getDatabase().endTransaction();
+            Log.w(LOG_TAG, "endTransaction");
+        }
     }
 
 
